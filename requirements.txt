@@ -1,0 +1,2 @@
+requests>=2.31.0
+MetaTrader5>=5.0.45
