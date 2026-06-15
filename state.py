@@ -11,6 +11,10 @@ CSV files (all under DATA_DIR):
   halted_pairs.csv      date, symbol, side
   <source>_minute.csv   timestamp, symbol, open, high, low, close
 
+The <source>_minute.csv files hold ONE row per symbol (a live snapshot): the
+latest candle is written in place, not appended, so the file never grows with
+duplicate rows.
+
 Alert rule: independent caps per side ('HIGH' / 'LOW'). When a side's count
 exceeds the cap, the symbol|side is halted for the rest of that broker day.
 """
@@ -24,17 +28,20 @@ import config
 _LEVELS = "prev_day_levels.csv"
 _COUNTS = "alert_counts.csv"
 _HALTED = "halted_pairs.csv"
+_HOT = "hot_symbols.csv"
 
 # Broker (XM server) date string, set by the MT5 monitor each cycle.
 _broker_date = None
+# Broker UTC offset in hours, measured live from a tick (None until known).
+_broker_offset_hours = None
 
 # In-memory caches so per-day work happens once per day, not every minute.
 #   _levels_cache[(symbol, source)] = (prev_high, prev_low)
 #   _levels_loaded_day[source]      = day string the levels were loaded for
-#   _last_candle_written[(source, symbol)] = last candle-time string written
+#   _minute_rows[source]            = {symbol: [ts, symbol, o, h, l, c]}
 _levels_cache = {}
 _levels_loaded_day = {}
-_last_candle_written = {}
+_minute_rows = {}
 
 _IST = timezone(timedelta(hours=config.IST_OFFSET_HOURS))
 
@@ -49,10 +56,26 @@ def ist_str(dt: datetime) -> str:
     return to_ist(dt).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def set_broker_time(broker_dt: datetime) -> None:
-    """Record the current broker time so the daily reset follows XM server time."""
-    global _broker_date
+def set_broker_time(broker_dt: datetime, true_utc: datetime = None) -> None:
+    """Record the current broker time so the daily reset follows XM server time.
+
+    If `true_utc` (the real UTC instant the tick was observed) is provided,
+    the broker's UTC offset is measured directly from the difference, so the
+    bar->IST conversion no longer relies on a hardcoded seasonal constant.
+    """
+    global _broker_date, _broker_offset_hours
     _broker_date = broker_dt.strftime("%Y-%m-%d")
+    if true_utc is not None:
+        diff = (broker_dt - true_utc).total_seconds() / 3600.0
+        # round to the nearest quarter hour to absorb sub-second jitter
+        _broker_offset_hours = round(diff * 4) / 4.0
+
+
+def broker_offset_hours() -> float:
+    """Broker UTC offset in hours: measured live if known, else the config."""
+    if _broker_offset_hours is not None:
+        return _broker_offset_hours
+    return float(config.MT5_SERVER_OFFSET_HOURS)
 
 
 def today_str() -> str:
@@ -83,6 +106,19 @@ def mark_levels_loaded(source: str) -> None:
 def get_cached_level(symbol: str, source: str):
     """Return cached (prev_high, prev_low) for a symbol, or None."""
     return _levels_cache.get((symbol, source))
+
+
+def read_all_levels(source: str) -> dict:
+    """Return {symbol: (prev_high, prev_low)} for one source from the CSV."""
+    out = {}
+    for (symbol, src), row in _read_levels().items():
+        if src != source:
+            continue
+        try:
+            out[symbol] = (float(row["prev_high"]), float(row["prev_low"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
 
 
 def save_prev_level(symbol: str, prev_high: float, prev_low: float,
@@ -122,28 +158,103 @@ def _write_levels(rows: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Minute OHLC append
+# Proximity (0.3% band) helpers
 # ---------------------------------------------------------------------------
-def append_minute(source: str, symbol: str, ts: str, o: float, h: float,
-                  l: float, c: float) -> bool:
-    """Append one minute candle, de-duplicated by (source, symbol, ts).
+def within_proximity(high: float, low: float, prev_high: float,
+                     prev_low: float, pct: float = None) -> bool:
+    """True if the candle high/low sits within `pct` of a prev-day level.
 
-    `ts` must be the candle's own time (IST string), not wall-clock now.
-    Returns True if a row was written, False if it was a duplicate.
+    The band is measured as a fraction of the prev-day level itself, so a
+    0.3% setting means |price - level| <= 0.003 * level for either the high
+    side (vs prev_high) or the low side (vs prev_low).
     """
-    key = (source, symbol)
-    if _last_candle_written.get(key) == ts:
-        return False  # already wrote this exact candle
-    _last_candle_written[key] = ts
+    if pct is None:
+        pct = config.PROXIMITY_PCT
+    near_high = prev_high and abs(high - prev_high) <= abs(prev_high) * pct
+    near_low = prev_low and abs(low - prev_low) <= abs(prev_low) * pct
+    return bool(near_high or near_low)
 
-    path = _path(f"{source}_minute.csv")
-    new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
-    with open(path, "a", newline="") as f:
+
+# ---------------------------------------------------------------------------
+# Minute OHLC snapshot (update-in-place, one row per symbol)
+# ---------------------------------------------------------------------------
+def _minute_path(source: str) -> str:
+    return _path(f"{source}_minute.csv")
+
+
+def _load_minute_rows(source: str) -> dict:
+    """Load the snapshot rows for a source into the in-memory map (once)."""
+    if source in _minute_rows:
+        return _minute_rows[source]
+    rows = {}
+    path = _minute_path(source)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                sym = r.get("symbol")
+                if sym:
+                    rows[sym] = [r.get("timestamp"), sym, r.get("open"),
+                                 r.get("high"), r.get("low"), r.get("close")]
+    _minute_rows[source] = rows
+    return rows
+
+
+def _write_minute_rows(source: str) -> None:
+    path = _minute_path(source)
+    rows = _minute_rows.get(source, {})
+    with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        if new_file:
-            w.writerow(["timestamp", "symbol", "open", "high", "low", "close"])
-        w.writerow([ts, symbol, o, h, l, c])
+        w.writerow(["timestamp", "symbol", "open", "high", "low", "close"])
+        for row in rows.values():
+            w.writerow(row)
+
+
+def update_minute(source: str, symbol: str, ts: str, o: float, h: float,
+                  l: float, c: float) -> bool:
+    """Update (not append) one symbol's latest minute candle.
+
+    The minute CSV keeps a single row per symbol; the row is rewritten in
+    place. `ts` must be the candle's own time (IST string). Returns True if
+    the row changed (new candle), False if the same candle was already stored.
+    """
+    rows = _load_minute_rows(source)
+    existing = rows.get(symbol)
+    if existing and existing[0] == ts:
+        return False  # same candle already snapshotted
+    rows[symbol] = [ts, symbol, o, h, l, c]
+    _write_minute_rows(source)
     return True
+
+
+# Backwards-compatible alias: callers that still say append_minute now upsert.
+append_minute = update_minute
+
+
+# ---------------------------------------------------------------------------
+# Hot (promoted to 1m) symbols snapshot
+# ---------------------------------------------------------------------------
+def save_hot_symbols(source: str, symbols) -> None:
+    """Persist the set of symbols promoted to 1m monitoring for `source`.
+
+    Rewrites this source's rows in data/hot_symbols.csv so the file always
+    shows the current promoted set across all sources. Symbols not listed
+    here are the ones filtered out by the 0.3%% proximity check (stay on 5m).
+    """
+    path = _path(_HOT)
+    rows = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                if r.get("source") and r.get("source") != source:
+                    rows.append([r.get("source"), r.get("symbol"),
+                                 r.get("tier", "1m")])
+    for sym in sorted(symbols):
+        rows.append([source, sym, "1m"])
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["source", "symbol", "tier"])
+        for row in rows:
+            w.writerow(row)
 
 
 # ---------------------------------------------------------------------------
@@ -180,31 +291,48 @@ def _write_counts(counts: dict) -> None:
             w.writerow([today_str(), symbol, side, count])
 
 
+def _read_halted() -> list:
+    """Return today's halted (symbol, side) rows from the CSV."""
+    path = _path(_HALTED)
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            if (r.get("date") == today_str()
+                    and r.get("symbol") and r.get("side")):
+                out.append((r["symbol"], r["side"]))
+    return out
+
+
+def _write_halted(pairs) -> None:
+    """Rewrite halted_pairs.csv with only the current broker day's rows.
+
+    Rewriting (instead of appending) prunes stale rows from previous days so
+    the file always reflects the latest halt state for today.
+    """
+    path = _path(_HALTED)
+    seen = set()
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "symbol", "side"])
+        for symbol, side in pairs:
+            if (symbol, side) in seen:
+                continue
+            seen.add((symbol, side))
+            w.writerow([today_str(), symbol, side])
+
+
 def _halt(symbol: str, side: str) -> None:
     if is_halted(symbol, side):
         return
-    path = _path(_HALTED)
-    # write header if the file is missing or empty (guards headerless files)
-    need_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if need_header:
-            w.writerow(["date", "symbol", "side"])
-        w.writerow([today_str(), symbol, side])
+    pairs = _read_halted()
+    pairs.append((symbol, side))
+    _write_halted(pairs)
 
 
 def is_halted(symbol: str, side: str) -> bool:
-    path = _path(_HALTED)
-    if not os.path.exists(path):
-        return False
-    with open(path, newline="") as f:
-        for r in csv.DictReader(f):
-            # tolerate malformed / headerless / blank rows
-            if (r.get("date") == today_str()
-                    and r.get("symbol") == symbol
-                    and r.get("side") == side):
-                return True
-    return False
+    return (symbol, side) in set(_read_halted())
 
 
 def register_cross(symbol: str, side: str):
