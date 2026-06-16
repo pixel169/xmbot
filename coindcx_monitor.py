@@ -26,7 +26,6 @@ import requests
 
 import config
 import state
-from telegram_alert import send_message, format_alert
 
 SOURCE = "coindcx"
 _BASE = "https://api.coindcx.com"
@@ -37,22 +36,38 @@ _CRYPTO_TOKENS_CACHE = "crypto_tokens.csv"
 # Quote/settlement tokens that are NOT the crypto base asset we care about.
 _QUOTE_TOKENS = {"USDT", "USDC", "USD", "INR", "BUSD", "DAI", "FDUSD"}
 
-# Seconds to wait between per-pair 1m calls in the hot-set pass (widened to
-# stay gentle on the public API now that the M5 scan is a single bulk call).
-_HOT_CALL_SPACING_SEC = 0.25
+# Seconds to wait between per-pair calls. Kept small so neither the M5 scan
+# nor the 1m hot-set poll overruns its window and starves the minute loop.
+_HOT_CALL_SPACING_SEC = 0.05
+
+# Pre-filter guard band: only pairs whose 24h ticker range comes within this
+# multiple of PROXIMITY_PCT of a prev-day level are worth a per-pair 5m/1h
+# fetch. Wide enough not to miss anything that could be near on the M5 close.
+_PREFILTER_BAND_MULT = 20.0
 
 # Pairs currently promoted to 1-minute monitoring (recomputed each M5 scan).
 _hot_pairs = set()
 
 
+# Transient network errors (DNS resolution, dropped connections) are retried
+# with a short backoff instead of dropping the whole call.
+_GET_RETRIES = 3
+_GET_BACKOFF_SEC = 1.0
+
+
 def _get(url: str, params: dict = None):
-    try:
-        r = _SESSION.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as exc:
-        print(f"[coindcx] GET failed {url}: {exc}")
-        return None
+    last_exc = None
+    for attempt in range(1, _GET_RETRIES + 1):
+        try:
+            r = _SESSION.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < _GET_RETRIES:
+                time.sleep(_GET_BACKOFF_SEC * attempt)
+    print(f"[coindcx] GET failed {url}: {last_exc}")
+    return None
 
 
 def list_futures_instruments():
@@ -235,6 +250,37 @@ def latest_m5(pair: str):
     return _latest_candle(pair, "5m")
 
 
+def _today_start_epoch_ms() -> int:
+    """Epoch (ms, UTC) for 00:00 of the current broker day."""
+    day = state.today_str()
+    dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def count_breaks_1h(pair: str, prev_high: float, prev_low: float):
+    """Count today's prev-day-level breaks using closed 1h candles.
+
+    Returns (high_breaks, low_breaks). One 1h candle is counted as a HIGH
+    break if its high >= prev_high, and a LOW break if its low <= prev_low.
+    """
+    candles = _candles(pair, "1h", 26)  # >24h of hourly bars
+    if not candles:
+        return 0, 0
+    start_ms = _today_start_epoch_ms()
+    high_breaks = low_breaks = 0
+    for c in candles:
+        try:
+            if int(c["time"]) < start_ms:
+                continue
+            if prev_high and float(c["high"]) >= prev_high:
+                high_breaks += 1
+            if prev_low and float(c["low"]) <= prev_low:
+                low_breaks += 1
+        except (KeyError, TypeError, ValueError):
+            continue
+    return high_breaks, low_breaks
+
+
 def _level_for(pair: str):
     """Return (prev_high, prev_low) for a pair, loading lazily if needed.
 
@@ -251,18 +297,11 @@ def _level_for(pair: str):
     return levels, True
 
 
-def _check_hl(pair: str, high: float, low: float, close: float,
-              prev_high: float, prev_low: float):
-    if high is not None and high >= prev_high:
-        ok, count, cap = state.register_cross(pair, "HIGH")
-        if ok:
-            send_message(format_alert(SOURCE, pair, "HIGH", close,
-                                      prev_high, count, cap))
-    if low is not None and low <= prev_low:
-        ok, count, cap = state.register_cross(pair, "LOW")
-        if ok:
-            send_message(format_alert(SOURCE, pair, "LOW", close,
-                                      prev_low, count, cap))
+def _record_breaks(pair: str, prev_high: float, prev_low: float):
+    """Count today's 1h breaks for a pair and persist/halt as needed."""
+    high_breaks, low_breaks = count_breaks_1h(pair, prev_high, prev_low)
+    state.set_break_count(SOURCE, pair, "HIGH", high_breaks)
+    state.set_break_count(SOURCE, pair, "LOW", low_breaks)
 
 
 def _scan_m5(pairs):
@@ -289,29 +328,43 @@ def _scan_m5(pairs):
             continue
         prev_high, prev_low = level
 
+        # Cheap pre-filter: skip pairs whose 24h range is nowhere near a
+        # prev-day level, so we only spend per-pair 5m/1h calls on candidates.
         row = ticker.get(pair)
-        high = low = last = None
-        if row:
-            high, low, last = row["high"], row["low"], row["last"]
-
-        # Fall back to one 5m candle only if the ticker lacks usable H/L.
-        if high is None or low is None:
-            candle = latest_m5(pair)
-            if candle:
-                high = float(candle["high"])
-                low = float(candle["low"])
-                last = float(candle["close"])
-                fallback_calls += 1
-                time.sleep(_HOT_CALL_SPACING_SEC)
-            else:
+        if row and row["high"] is not None and row["low"] is not None:
+            band = config.PROXIMITY_PCT * _PREFILTER_BAND_MULT
+            if not state.within_proximity(row["high"], row["low"],
+                                          prev_high, prev_low, pct=band):
+                # Keep a light snapshot from the ticker last price and move on.
+                if row["last"] is not None:
+                    state.update_minute(SOURCE, pair, _now_ist(),
+                                        row["last"], row["last"],
+                                        row["last"], row["last"])
                 continue
 
-        close = last if last is not None else high
-        state.update_minute(SOURCE, pair, _now_ist(),
-                            close, high, low, close)
-        _check_hl(pair, high, low, close, prev_high, prev_low)
-        if state.within_proximity(high, low, prev_high, prev_low):
-            hot.add(pair)
+        # Candidate: use the M5 candle's own high/low/close for the proximity
+        # decision and breach check, exactly like the MT5 monitor.
+        candle = latest_m5(pair)
+        if not candle:
+            continue
+        fallback_calls += 1
+        time.sleep(_HOT_CALL_SPACING_SEC)
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        open_ = float(candle.get("open", close))
+
+        state.update_minute(SOURCE, pair, _candle_time_ist(candle),
+                            open_, high, low, close)
+        # Count today's breaks from 1h candles; halts the side if it broke
+        # the prev-day level more than the per-day cap.
+        _record_breaks(pair, prev_high, prev_low)
+        # Promote to 1m only when within proximity and not fully halted.
+        if not state.within_proximity(high, low, prev_high, prev_low):
+            continue
+        if state.is_halted(pair, "HIGH") and state.is_halted(pair, "LOW"):
+            continue
+        hot.add(pair)
 
     _hot_pairs = hot
     state.save_hot_symbols(SOURCE, hot)
@@ -334,11 +387,9 @@ def _scan_1m():
         high = float(candle["high"])
         low = float(candle["low"])
         close = float(candle["close"])
-        written = state.update_minute(
+        state.update_minute(
             SOURCE, pair, ts, float(candle["open"]), high, low, close,
         )
-        if written:
-            _check_hl(pair, high, low, close, prev_high, prev_low)
         time.sleep(_HOT_CALL_SPACING_SEC)
 
 
@@ -348,8 +399,12 @@ def run_cycle(is_m5_boundary: bool = True):
     if is_m5_boundary:
         pairs = list_futures_instruments()
         if not pairs:
+            # Network blip on the instrument list: still poll the existing
+            # hot set so 1m snapshots keep updating.
+            _scan_1m()
             return
         print(f"[coindcx] monitoring {len(pairs)} futures instruments")
         _scan_m5(pairs)
-    else:
-        _scan_1m()
+    # Always poll the hot set at 1m, including on the M5 boundary, so every
+    # hot symbol's latest 1m candle is refreshed every minute.
+    _scan_1m()

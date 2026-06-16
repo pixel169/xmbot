@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 
 import coindcx_monitor
 import mt5_monitor
-import telegram_alert
 
 
 def _run_safe(name, fn, *args):
@@ -38,7 +37,6 @@ def _sleep_to_next_minute():
 
 def main():
     print("Market breakout alerter started. Ctrl+C to stop.")
-    telegram_alert.send_startup_ping()
     first = True
     while True:
         now = datetime.now(timezone.utc)
